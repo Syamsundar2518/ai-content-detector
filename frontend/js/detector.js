@@ -18,7 +18,7 @@
    e.g. https://ai-content-detector-backend.onrender.com
    ========================================================================= */
 
-const BACKEND_URL = 'https://ai-content-detector-lixc.onrender.com';
+const BACKEND_URL = "https://ai-content-detector-lixc.onrender.com";
 
 document.addEventListener('DOMContentLoaded', () => {
 

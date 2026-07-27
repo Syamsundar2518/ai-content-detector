@@ -60,12 +60,13 @@ We can't analyze a whole video efficiently with free tools, so we:
 2. Run each frame through the **same** image analysis above.
 3. Average the results into one final verdict.
 
-### Optional: free AI models instead of statistics
-If you create a **free Hugging Face account** and put a token in `backend/.env`, the app will instead call these free public models:
-- Text: `roberta-base-openai-detector`
+### Real AI model detection (required)
+This app uses real, free, open-source AI models via Hugging Face's Inference API:
+- Text: `Hello-SimpleAI/chatgpt-detector-roberta`
 - Image: `Organika/sdxl-detector`
+- Video: samples 4 frames and runs each through the image model above
 
-If the token is missing, wrong, or the model is temporarily asleep, the app automatically falls back to the offline statistical method above — so it always works either way.
+You need a **free Hugging Face account and API token** for this to work — see Step 2 below. If the token is missing or invalid, the app returns a clear "Setup needed" message instead of crashing. If the model is temporarily "waking up" or Hugging Face's free tier rate-limits you, the app retries automatically and shows an honest error if it still can't get through.
 
 ---
 
@@ -82,7 +83,10 @@ cd ai-content-detector/backend
 pip install -r requirements.txt
 ```
 
-(Optional) Copy `.env.example` to `.env` and paste in a free Hugging Face token if you want the online AI models.
+**Required:** Copy `.env.example` to `.env`, then get a free token at [huggingface.co/settings/tokens](https://huggingface.co/settings/tokens) (click "New token", choose the "Read" role) and paste it in:
+```
+HUGGINGFACE_API_TOKEN=hf_xxxxxxxxxxxxxxxxxxxx
+```
 
 Start the server:
 

@@ -1,180 +1,145 @@
 """
-text_detector.py
------------------
-This file decides whether a piece of TEXT looks "AI-generated" or "human-written".
+text_detector.py  (v2 — REAL AI MODEL)
+----------------------------------------
+WHAT CHANGED FROM BEFORE:
+The old version guessed using math (sentence length patterns, word
+repetition, etc). This version instead asks a real, pre-trained AI model
+to make the decision. We do this by sending the text to Hugging Face's
+free "Inference API" — think of it like a web request to a robot that
+has already been trained to spot AI writing.
 
-Two methods are used, in this order:
+MODEL USED: Hello-SimpleAI/chatgpt-detector-roberta
+  - This is a free, open-source model made specifically to detect
+    ChatGPT-style AI text vs human text.
+  - It runs on Hugging Face's servers, not your computer or Render — so
+    your app stays small and fast (important for Render's free tier).
 
-1. ONLINE method (optional): if the user has set up a free Hugging Face API
-   token in the .env file, we send the text to a public AI-text-detection
-   model and use its answer.
-
-2. OFFLINE method (always available, no internet/API key needed): we run our
-   own simple statistics on the text. This is the same basic idea that most
-   free "AI detectors" use under the hood:
-
-   - Burstiness: human writing has a mix of short and long sentences.
-     AI writing tends to produce sentences that are more uniform in length.
-   - Repetition: AI text often reuses the same words/phrases more than
-     humans naturally do.
-   - Vocabulary variety (Type-Token Ratio): how many UNIQUE words are used
-     compared to the total number of words. Very high or very repetitive
-     patterns can be a signal.
-   - Average sentence length: AI text is often "smoother" and more
-     consistent in structure.
-
-IMPORTANT HONESTY NOTE:
-These signals are estimates, not proof. No free tool can be 100% certain
-whether text was written by AI. We are upfront about that in the UI.
+WHAT THIS FILE DOES, STEP BY STEP:
+  1. Reads your free Hugging Face API token from the .env file.
+  2. Sends the text to the model's API endpoint.
+  3. Handles two special situations gracefully:
+       a) The model is "cold" (asleep) and needs ~20 seconds to wake up
+          — we wait and retry automatically instead of failing.
+       b) The API is temporarily unavailable — we return a clear,
+          honest error message instead of crashing.
+  4. Turns the model's raw score into our friendly label + percentage.
 """
 
 import os
-import re
-import statistics
+import time
 import requests
 
-# Free Hugging Face model that is specifically trained to spot AI text.
-# (You can swap this for any other public text-classification model.)
-HF_MODEL_URL = "https://api-inference.huggingface.co/models/roberta-base-openai-detector"
+HF_MODEL_URL = "https://api-inference.huggingface.co/models/Hello-SimpleAI/chatgpt-detector-roberta"
+
+# How many times we'll retry if the model is still "waking up"
+MAX_RETRIES = 3
+# How long to wait (seconds) between retries
+RETRY_DELAY = 6
 
 
-def _split_sentences(text: str):
-    """Break text into sentences using simple punctuation rules."""
-    sentences = re.split(r"(?<=[.!?])\s+", text.strip())
-    return [s for s in sentences if s.strip()]
-
-
-def _split_words(text: str):
-    """Break text into lowercase words, ignoring punctuation."""
-    return re.findall(r"[a-zA-Z']+", text.lower())
-
-
-def _offline_analysis(text: str):
+def _call_huggingface(text: str, hf_token: str):
     """
-    Our own free, no-API statistics-based detector.
-    Returns (label, confidence_percent, details_dict)
+    Sends the text to the Hugging Face model and returns the raw response,
+    automatically retrying if the model is still loading ("cold start").
     """
-    sentences = _split_sentences(text)
-    words = _split_words(text)
+    headers = {"Authorization": f"Bearer {hf_token}"}
 
-    if len(words) < 5:
-        return "Not enough text", 0, {
-            "reason": "Please enter at least a few sentences for a meaningful result."
-        }
+    for attempt in range(MAX_RETRIES):
+        try:
+            response = requests.post(
+                HF_MODEL_URL,
+                headers=headers,
+                json={"inputs": text[:2000]},  # trim very long text to keep requests fast
+                timeout=25,
+            )
+        except requests.exceptions.RequestException:
+            return None  # network problem — no internet, DNS issue, etc.
 
-    # 1. Sentence length list (in words)
-    sentence_lengths = [len(_split_words(s)) for s in sentences if _split_words(s)]
+        # 200 = success
+        if response.status_code == 200:
+            return response.json()
 
-    # 2. Burstiness = how much sentence lengths vary.
-    #    Low variation (a low standard deviation) => more "AI-like" (uniform).
-    if len(sentence_lengths) > 1:
-        stdev = statistics.pstdev(sentence_lengths)
-        mean_len = statistics.mean(sentence_lengths)
-        # normalize: coefficient of variation (0 = totally uniform, higher = more human-like variety)
-        burstiness = stdev / mean_len if mean_len > 0 else 0
-    else:
-        burstiness = 0.5  # not enough sentences to judge, assume neutral
+        # 503 usually means "model is loading, try again shortly"
+        if response.status_code == 503:
+            time.sleep(RETRY_DELAY)
+            continue
 
-    # 3. Vocabulary variety (Type-Token Ratio)
-    unique_words = set(words)
-    ttr = len(unique_words) / len(words)
+        # 401 = bad/missing token, 429 = rate limited, or anything else
+        return {"__error__": response.status_code}
 
-    # 4. Repetition score: how often the most common words repeat
-    from collections import Counter
-    common = Counter(words).most_common(5)
-    repetition_ratio = sum(c for _, c in common) / len(words)
-
-    # ---- Combine signals into one AI-probability score (0 to 1) ----
-    # Each signal nudges the score up (more AI-like) or down (more human-like).
-    ai_score = 0.5  # start neutral
-
-    # Low burstiness (uniform sentence lengths) -> more AI-like
-    if burstiness < 0.3:
-        ai_score += 0.20
-    elif burstiness > 0.6:
-        ai_score -= 0.15
-
-    # Very "smooth"/average vocabulary variety -> more AI-like
-    if 0.40 <= ttr <= 0.55:
-        ai_score += 0.15
-    elif ttr > 0.70:
-        ai_score -= 0.15  # very rich, unusual vocabulary => human-like
-
-    # High repetition of the same few words -> more AI-like (AI often over-uses
-    # transition words / safe phrasing)
-    if repetition_ratio > 0.18:
-        ai_score += 0.10
-    else:
-        ai_score -= 0.05
-
-    # Clamp between 0.05 and 0.95 (we never claim 100% certainty)
-    ai_score = max(0.05, min(0.95, ai_score))
-
-    label = "Likely AI Generated" if ai_score >= 0.5 else "Likely Human Created"
-    confidence = round(ai_score * 100) if ai_score >= 0.5 else round((1 - ai_score) * 100)
-
-    details = {
-        "method": "offline-statistical",
-        "sentence_count": len(sentences),
-        "word_count": len(words),
-        "average_sentence_length": round(statistics.mean(sentence_lengths), 1) if sentence_lengths else 0,
-        "vocabulary_variety_percent": round(ttr * 100, 1),
-        "repetition_percent": round(repetition_ratio * 100, 1),
-    }
-
-    return label, confidence, details
-
-
-def _online_analysis(text: str, hf_token: str):
-    """
-    Calls the free Hugging Face Inference API for a model trained to
-    detect AI-generated text. Returns None if it fails for any reason
-    (no internet, no token, model asleep, etc.) so we can fall back
-    to the offline method.
-    """
-    try:
-        headers = {"Authorization": f"Bearer {hf_token}"}
-        response = requests.post(
-            HF_MODEL_URL,
-            headers=headers,
-            json={"inputs": text[:2000]},  # keep requests small/fast
-            timeout=15,
-        )
-        if response.status_code != 200:
-            return None
-
-        data = response.json()
-        # Expected shape: [[{"label": "Fake", "score": 0.9}, {"label": "Real", "score": 0.1}]]
-        scores = data[0] if isinstance(data, list) else None
-        if not scores:
-            return None
-
-        fake_score = next((s["score"] for s in scores if s["label"].lower() in ("fake", "ai")), None)
-        if fake_score is None:
-            return None
-
-        label = "Likely AI Generated" if fake_score >= 0.5 else "Likely Human Created"
-        confidence = round(fake_score * 100) if fake_score >= 0.5 else round((1 - fake_score) * 100)
-        return label, confidence, {"method": "huggingface-roberta-openai-detector"}
-
-    except Exception:
-        return None
+    return {"__error__": "timeout_after_retries"}
 
 
 def detect_text(text: str):
     """
     Main function called by app.py.
-    Tries the online model first (if a token is set), otherwise uses the
-    offline statistical method.
+    Returns: { "result": "...", "confidence": 87, "details": {...} }
     """
     hf_token = os.getenv("HUGGINGFACE_API_TOKEN", "").strip()
 
-    if hf_token:
-        result = _online_analysis(text, hf_token)
-        if result:
-            label, confidence, details = result
-            return {"result": label, "confidence": confidence, "details": details}
+    if not hf_token:
+        return {
+            "result": "Setup needed",
+            "confidence": 0,
+            "details": {
+                "reason": "No Hugging Face API token found. Add HUGGINGFACE_API_TOKEN "
+                          "to your backend/.env file (see .env.example)."
+            },
+        }
 
-    # Fallback (or default if no token was provided)
-    label, confidence, details = _offline_analysis(text)
-    return {"result": label, "confidence": confidence, "details": details}
+    if len(text.strip()) < 5:
+        return {
+            "result": "Not enough text",
+            "confidence": 0,
+            "details": {"reason": "Please enter at least a few sentences."},
+        }
+
+    raw = _call_huggingface(text, hf_token)
+
+    if raw is None:
+        return {
+            "result": "Could not analyze",
+            "confidence": 0,
+            "details": {"reason": "Could not reach Hugging Face. Check your internet connection."},
+        }
+
+    if isinstance(raw, dict) and "__error__" in raw:
+        code = raw["__error__"]
+        if code == 401:
+            reason = "Your Hugging Face API token was rejected. Double-check it in backend/.env."
+        elif code == 429:
+            reason = "Hugging Face's free tier rate limit was hit. Please wait a minute and try again."
+        else:
+            reason = f"The AI model service returned an error (code: {code}). Please try again shortly."
+        return {"result": "Could not analyze", "confidence": 0, "details": {"reason": reason}}
+
+    # Expected successful shape:
+    # [[{"label": "ChatGPT", "score": 0.9}, {"label": "Human", "score": 0.1}]]
+    try:
+        scores = raw[0] if isinstance(raw, list) else None
+        ai_entry = next(
+            (s for s in scores if s["label"].lower() in ("chatgpt", "fake", "ai", "generated")),
+            None,
+        )
+        if not ai_entry:
+            raise ValueError("Unexpected response shape")
+
+        ai_probability = ai_entry["score"]
+    except Exception:
+        return {
+            "result": "Could not analyze",
+            "confidence": 0,
+            "details": {"reason": "Received an unexpected response from the AI model. Please try again."},
+        }
+
+    label = "Likely AI Generated" if ai_probability >= 0.5 else "Likely Human Created"
+    confidence = round(ai_probability * 100) if ai_probability >= 0.5 else round((1 - ai_probability) * 100)
+
+    return {
+        "result": label,
+        "confidence": confidence,
+        "details": {
+            "method": "huggingface-chatgpt-detector-roberta",
+            "model_ai_score_percent": round(ai_probability * 100, 1),
+        },
+    }
