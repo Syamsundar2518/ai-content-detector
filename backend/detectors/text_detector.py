@@ -52,7 +52,10 @@ def _call_huggingface(text: str, hf_token: str):
                 json={"inputs": text[:2000]},  # trim very long text to keep requests fast
                 timeout=25,
             )
-        except requests.exceptions.RequestException:
+            print("Status Code:", response.status_code)
+            print("Response:", response.text)
+        except requests.exceptions.RequestException as e:
+            print("Hugging Face Request Error:", e)
             return None  # network problem — no internet, DNS issue, etc.
 
         # 200 = success
