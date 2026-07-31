@@ -1,134 +1,116 @@
 """
-text_detector.py  (v2 — REAL AI MODEL)
-----------------------------------------
-WHAT CHANGED FROM BEFORE:
-The old version guessed using math (sentence length patterns, word
-repetition, etc). This version instead asks a real, pre-trained AI model
-to make the decision. We do this by sending the text to Hugging Face's
-free "Inference API" — think of it like a web request to a robot that
-has already been trained to spot AI writing.
+text_detector.py  (REPLACEMENT — v3)
+--------------------------------------
+WHAT CHANGED FROM v2:
+  1. No longer calls Hugging Face directly — it now goes through the
+     shared `HuggingFaceRouterEngine` in base.py, which uses the
+     CURRENT, supported https://router.huggingface.co endpoint (the old
+     one this file used before, api-inference.huggingface.co, has been
+     shut down by Hugging Face and returns errors — that's why detection
+     stopped working).
+  2. Swapped the underlying AI model. The old model
+     (Hello-SimpleAI/chatgpt-detector-roberta) is an unmaintained,
+     GPT-2-era research model. It's replaced with
+     desklib/ai-text-detector-v1.01 — a modern, actively-used model that
+     currently leads the independent RAID Benchmark for AI-text
+     detection, is MIT-licensed, and is confirmed to run on Hugging
+     Face's current Inference Providers.
 
-MODEL USED: Hello-SimpleAI/chatgpt-detector-roberta
-  - This is a free, open-source model made specifically to detect
-    ChatGPT-style AI text vs human text.
-  - It runs on Hugging Face's servers, not your computer or Render — so
-    your app stays small and fast (important for Render's free tier).
+MODEL LIMITATIONS (be upfront about these):
+  - Trained and evaluated primarily on English text.
+  - Like every AI-text detector, it can be fooled by heavy paraphrasing
+    or adversarial rewriting, and can occasionally flag simple, very
+    formulaic human writing as AI. Treat results as an estimate.
 
-WHAT THIS FILE DOES, STEP BY STEP:
-  1. Reads your free Hugging Face API token from the .env file.
-  2. Sends the text to the model's API endpoint.
-  3. Handles two special situations gracefully:
-       a) The model is "cold" (asleep) and needs ~20 seconds to wake up
-          — we wait and retry automatically instead of failing.
-       b) The API is temporarily unavailable — we return a clear,
-          honest error message instead of crashing.
-  4. Turns the model's raw score into our friendly label + percentage.
+WHY THIS DESIGN IS MODULAR:
+  This file doesn't know any HTTP/networking details — that all lives in
+  base.py. If Hugging Face ever changes again, or you want to switch to
+  a different provider (e.g. a paid API), you only need to change
+  base.py (or write a new engine with the same `call()` method) —
+  nothing here or in app.py has to change.
+
+API CONTRACT (unchanged from before — the frontend needs no changes):
+  detect_text(text) -> {
+      "result": "Likely AI Generated" | "Likely Human Created"
+                 | "Setup needed" | "Not enough text" | "Could not analyze",
+      "confidence": 0-100,
+      "details": { ... }
+  }
 """
 
-import os
-import time
-import requests
+import logging
 
-HF_MODEL_URL = "https://api-inference.huggingface.co/models/Hello-SimpleAI/chatgpt-detector-roberta"
+from .base import HuggingFaceRouterEngine, DetectionEngineError
 
-# How many times we'll retry if the model is still "waking up"
-MAX_RETRIES = 3
-# How long to wait (seconds) between retries
-RETRY_DELAY = 6
+logger = logging.getLogger("ai_content_detector")
+
+# The model this detector uses. To swap models later, change ONLY this line.
+TEXT_MODEL_ID = "desklib/ai-text-detector-v1.01"
+
+_engine = HuggingFaceRouterEngine(model_id=TEXT_MODEL_ID)
+
+# Label text that this (and most similar) models use to mean "AI-written".
+# Kept as a list because different model versions/providers sometimes use
+# slightly different label spellings (e.g. "AI", "LABEL_1", "generated").
+AI_LABEL_HINTS = ("ai", "generated", "machine", "artificial", "fake", "label_1")
 
 
-def _call_huggingface(text: str, hf_token: str):
+def _extract_ai_probability(raw_response):
     """
-    Sends the text to the Hugging Face model and returns the raw response,
-    automatically retrying if the model is still loading ("cold start").
+    Turns the model's raw JSON response into a single 0.0-1.0 "probability
+    this text is AI-generated" number. Handles the standard Hugging Face
+    text-classification response shape:
+        [[{"label": "...", "score": 0.9}, {"label": "...", "score": 0.1}]]
+    or, less commonly, a flat list without the extra wrapping:
+        [{"label": "...", "score": 0.9}, {"label": "...", "score": 0.1}]
+    Raises ValueError if the shape is not recognized, so the caller can
+    turn that into a clear, friendly error instead of crashing.
     """
-    headers = {"Authorization": f"Bearer {hf_token}"}
+    if isinstance(raw_response, list) and raw_response and isinstance(raw_response[0], list):
+        scores = raw_response[0]
+    elif isinstance(raw_response, list) and raw_response and isinstance(raw_response[0], dict):
+        scores = raw_response
+    else:
+        raise ValueError(f"Unrecognized response shape: {type(raw_response)}")
 
-    for attempt in range(MAX_RETRIES):
-        try:
-            response = requests.post(
-                HF_MODEL_URL,
-                headers=headers,
-                json={"inputs": text[:2000]},  # trim very long text to keep requests fast
-                timeout=25,
-            )
-            print("Status Code:", response.status_code)
-            print("Response:", response.text)
-        except requests.exceptions.RequestException as e:
-            print("Hugging Face Request Error:", e)
-            return None  # network problem — no internet, DNS issue, etc.
+    ai_entry = next(
+        (s for s in scores if any(hint in str(s.get("label", "")).lower() for hint in AI_LABEL_HINTS)),
+        None,
+    )
+    if ai_entry is None:
+        raise ValueError(f"Could not find an AI-labeled score in: {scores}")
 
-        # 200 = success
-        if response.status_code == 200:
-            return response.json()
-
-        # 503 usually means "model is loading, try again shortly"
-        if response.status_code == 503:
-            time.sleep(RETRY_DELAY)
-            continue
-
-        # 401 = bad/missing token, 429 = rate limited, or anything else
-        return {"__error__": response.status_code}
-
-    return {"__error__": "timeout_after_retries"}
+    return float(ai_entry["score"])
 
 
-def detect_text(text: str):
+def detect_text(text: str) -> dict:
     """
-    Main function called by app.py.
-    Returns: { "result": "...", "confidence": 87, "details": {...} }
+    Main function called by app.py. Always returns a plain dict matching
+    the API contract above — never raises, so app.py doesn't need any
+    special error handling beyond what it already has.
     """
-    hf_token = os.getenv("HUGGINGFACE_API_TOKEN", "").strip()
+    text = (text or "").strip()
 
-    if not hf_token:
-        return {
-            "result": "Setup needed",
-            "confidence": 0,
-            "details": {
-                "reason": "No Hugging Face API token found. Add HUGGINGFACE_API_TOKEN "
-                          "to your backend/.env file (see .env.example)."
-            },
-        }
-
-    if len(text.strip()) < 5:
+    if len(text) < 5:
         return {
             "result": "Not enough text",
             "confidence": 0,
             "details": {"reason": "Please enter at least a few sentences."},
         }
 
-    raw = _call_huggingface(text, hf_token)
-
-    if raw is None:
-        return {
-            "result": "Could not analyze",
-            "confidence": 0,
-            "details": {"reason": "Could not reach Hugging Face. Check your internet connection."},
-        }
-
-    if isinstance(raw, dict) and "__error__" in raw:
-        code = raw["__error__"]
-        if code == 401:
-            reason = "Your Hugging Face API token was rejected. Double-check it in backend/.env."
-        elif code == 429:
-            reason = "Hugging Face's free tier rate limit was hit. Please wait a minute and try again."
-        else:
-            reason = f"The AI model service returned an error (code: {code}). Please try again shortly."
-        return {"result": "Could not analyze", "confidence": 0, "details": {"reason": reason}}
-
-    # Expected successful shape:
-    # [[{"label": "ChatGPT", "score": 0.9}, {"label": "Human", "score": 0.1}]]
     try:
-        scores = raw[0] if isinstance(raw, list) else None
-        ai_entry = next(
-            (s for s in scores if s["label"].lower() in ("chatgpt", "fake", "ai", "generated")),
-            None,
-        )
-        if not ai_entry:
-            raise ValueError("Unexpected response shape")
+        raw_response = _engine.call(json_payload={"inputs": text[:2000]})
+        ai_probability = _extract_ai_probability(raw_response)
 
-        ai_probability = ai_entry["score"]
-    except Exception:
+    except DetectionEngineError as exc:
+        # Errors from base.py are already safe, human-readable messages.
+        logger.warning("Text detection failed (%s): %s", exc.kind, exc.reason)
+        result_label = "Setup needed" if exc.kind == "missing_token" else "Could not analyze"
+        return {"result": result_label, "confidence": 0, "details": {"reason": exc.reason}}
+
+    except ValueError as exc:
+        # The model responded, but not in a shape we understood.
+        logger.error("Unexpected response shape from '%s': %s", TEXT_MODEL_ID, exc)
         return {
             "result": "Could not analyze",
             "confidence": 0,
@@ -138,11 +120,13 @@ def detect_text(text: str):
     label = "Likely AI Generated" if ai_probability >= 0.5 else "Likely Human Created"
     confidence = round(ai_probability * 100) if ai_probability >= 0.5 else round((1 - ai_probability) * 100)
 
+    logger.info("Text detection result: %s (%s%%)", label, confidence)
+
     return {
         "result": label,
         "confidence": confidence,
         "details": {
-            "method": "huggingface-chatgpt-detector-roberta",
+            "method": f"huggingface-router:{TEXT_MODEL_ID}",
             "model_ai_score_percent": round(ai_probability * 100, 1),
         },
     }

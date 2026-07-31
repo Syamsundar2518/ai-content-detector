@@ -61,12 +61,15 @@ We can't analyze a whole video efficiently with free tools, so we:
 3. Average the results into one final verdict.
 
 ### Real AI model detection (required)
-This app uses real, free, open-source AI models via Hugging Face's Inference API:
-- Text: `Hello-SimpleAI/chatgpt-detector-roberta`
-- Image: `Organika/sdxl-detector`
-- Video: samples 4 frames and runs each through the image model above
+This app uses real, free, open-source AI models via Hugging Face's **current** Inference Providers router (`https://router.huggingface.co`) — the old `api-inference.huggingface.co` endpoint has been permanently shut down by Hugging Face and will not work.
 
-You need a **free Hugging Face account and API token** for this to work — see Step 2 below. If the token is missing or invalid, the app returns a clear "Setup needed" message instead of crashing. If the model is temporarily "waking up" or Hugging Face's free tier rate-limits you, the app retries automatically and shows an honest error if it still can't get through.
+- Text: [`desklib/ai-text-detector-v1.01`](https://huggingface.co/desklib/ai-text-detector-v1.01) — currently leads the independent RAID Benchmark for AI-text detection, MIT-licensed, actively maintained.
+- Image: [`Organika/sdxl-detector`](https://huggingface.co/Organika/sdxl-detector) — actively maintained, used in 100+ community Spaces.
+- Video: samples 4 frames and runs each through the image model above.
+
+All the actual networking, retry, and error-handling logic lives in one shared file: `backend/detectors/base.py`. If you ever want to swap providers (e.g. use a paid API instead), you only need to change that one file — the rest of the app doesn't need to change.
+
+You need a **free Hugging Face account and API token** for this to work — see Step 2 below. If the token is missing or invalid, the app returns a clear "Setup needed" message instead of crashing. If a model is temporarily "waking up" or Hugging Face's free tier rate-limits you, the app retries automatically and shows an honest error if it still can't get through. Every request is also logged (see your terminal locally, or Render's "Logs" tab in production) to make problems easy to diagnose.
 
 ---
 
