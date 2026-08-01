@@ -124,7 +124,10 @@ def api_detect_image():
         return jsonify({"error": f"Image is too large ({size_mb:.1f}MB). Max is {MAX_IMAGE_SIZE_MB}MB."}), 400
 
     logger.info("Image detection request received: '%s' (%.2fMB).", file.filename, size_mb)
-    result = detect_image(file_bytes)
+    # Map the file extension to a proper MIME type — required by Hugging
+    # Face's current Router for raw image uploads (see image_detector.py).
+    content_type = "image/png" if ext == "png" else "image/jpeg"
+    result = detect_image(file_bytes, content_type=content_type)
     logger.info("Image detection request completed: %s", result.get("result"))
     return jsonify(result)
 

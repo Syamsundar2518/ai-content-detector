@@ -1,14 +1,20 @@
 """
-image_detector.py  (REPLACEMENT — v3)
+image_detector.py  (REPLACEMENT — v4)
 ----------------------------------------
-WHAT CHANGED FROM v2:
+WHAT CHANGED FROM v3 (bugfix):
+Hugging Face's current Router endpoint requires an explicit Content-Type
+header on raw image uploads (the old endpoint guessed it automatically).
+Without it, every image request failed with:
+    HTTP 400 - "No content type provided and no default one configured."
+detect_image() now accepts an optional `content_type` parameter (e.g.
+"image/png") so callers that know the real file type can pass it along.
+It defaults to "image/jpeg" for backward compatibility — video_detector.py
+doesn't need any changes, since it always encodes frames as JPEG already.
+
 Same underlying model as before (Organika/sdxl-detector — verified still
 actively maintained: 78k+ downloads/month, used in 100+ community Spaces,
-confirmed supported on Hugging Face's current Inference Providers), but
-this file no longer talks to Hugging Face directly. It now goes through
-the shared `HuggingFaceRouterEngine` in base.py, which uses the CURRENT
-https://router.huggingface.co endpoint instead of the old
-api-inference.huggingface.co endpoint that Hugging Face has shut down.
+confirmed supported on Hugging Face's current Inference Providers), still
+called through the shared `HuggingFaceRouterEngine` in base.py.
 
 This file is also reused by video_detector.py — each sampled video frame
 is passed through the exact same detect_image() function below.
@@ -19,7 +25,7 @@ MODEL LIMITATIONS (be upfront about these):
     proprietary tools) or heavily edited/compressed images.
 
 API CONTRACT (unchanged — the frontend needs no changes):
-  detect_image(image_bytes) -> {
+  detect_image(image_bytes, content_type="image/jpeg") -> {
       "result": "Likely AI Generated" | "Likely Human Created"
                  | "Setup needed" | "Could not analyze",
       "confidence": 0-100,
@@ -62,14 +68,19 @@ def _extract_ai_probability(raw_response):
     return float(ai_entry["score"])
 
 
-def detect_image(image_bytes: bytes) -> dict:
+def detect_image(image_bytes: bytes, content_type: str = "image/jpeg") -> dict:
     """
     Main function called by app.py (and by video_detector.py, once per
     sampled frame). Always returns a plain dict matching the API contract
     above — never raises.
+
+    `content_type` should match the real image format when known (e.g.
+    "image/png" for a .png upload) — this is required by Hugging Face's
+    current Router. Defaults to "image/jpeg" for callers that don't
+    specify it (like video frame sampling, which is always JPEG).
     """
     try:
-        raw_response = _engine.call(raw_bytes=image_bytes)
+        raw_response = _engine.call(raw_bytes=image_bytes, content_type=content_type)
         ai_probability = _extract_ai_probability(raw_response)
 
     except DetectionEngineError as exc:

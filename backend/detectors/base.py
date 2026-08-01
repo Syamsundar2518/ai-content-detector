@@ -101,16 +101,25 @@ class HuggingFaceRouterEngine:
             )
         return token
 
-    def call(self, *, json_payload: dict = None, raw_bytes: bytes = None):
+    def call(self, *, json_payload: dict = None, raw_bytes: bytes = None, content_type: str = "image/jpeg"):
         """
         Sends a request to the configured model. Provide EITHER
         json_payload (for text-style inputs) OR raw_bytes (for images).
         Retries automatically if the model is still loading on Hugging
         Face's servers. Raises DetectionEngineError on any failure —
         callers should catch this and turn it into a user-facing message.
+
+        `content_type` is only used when sending raw_bytes. Hugging
+        Face's current Router requires an explicit Content-Type header
+        for raw binary uploads (unlike the old endpoint, which guessed).
+        Defaults to "image/jpeg" since that covers the vast majority of
+        uploads/video frames; pass a specific value (e.g. "image/png")
+        if you know the exact format.
         """
         token = self._get_token()
         headers = {"Authorization": f"Bearer {token}"}
+        if raw_bytes is not None:
+            headers["Content-Type"] = content_type
 
         for attempt in range(1, MAX_RETRIES + 1):
             logger.info(
