@@ -1,28 +1,35 @@
 """
-detectors/base.py  (NEW FILE)
+detectors/base.py  (REPLACEMENT — v2)
 -------------------------------
-Shared infrastructure for calling AI detection models through Hugging
-Face's CURRENT Router API (https://router.huggingface.co).
+Shared infrastructure for calling AI detection services.
+
+WHAT CHANGED IN THIS UPDATE:
+Added a second engine, `SaplingTextEngine`, alongside the existing
+`HuggingFaceRouterEngine`. This is used ONLY by text_detector.py now.
+image_detector.py (and therefore video_detector.py, which reuses it)
+still uses HuggingFaceRouterEngine — that path was never reported broken,
+so it was left untouched.
+
+WHY TEXT DETECTION MOVED OFF HUGGING FACE:
+Hugging Face's free serverless Inference API only reliably serves
+large, popular, "warm" models. Community-uploaded text-classification
+models (which is what free AI-text detectors are) routinely fail to
+load on it — this project hit that wall twice with two different
+models. Rather than guess at a third Hugging Face model, text detection
+now uses Sapling.ai's dedicated AI Detector API
+(https://sapling.ai/docs/api/detector/) — a purpose-built product for
+exactly this task, not a community model riding on shared inference
+infrastructure. It is actively maintained (documented updates as recent
+as June 2026) and offers a free, rate-limited developer API key (50,000
+characters/24 hours) requiring only a free account — no credit card.
 
 WHY THIS FILE EXISTS
-Hugging Face deleted its old endpoint (https://api-inference.huggingface.co
-now returns HTTP 410 Gone) and replaced it with a new one:
-https://router.huggingface.co. This file contains the ONLY code in the
-whole project that knows that URL and how to call it.
-
-Both text_detector.py and image_detector.py need the exact same things:
-  - Read an API token from environment variables
-  - Send a request to a Hugging Face model through the Router
-  - Retry automatically if the model is still "waking up" (cold start)
-  - Turn network/API problems into clear, typed, human-readable errors
-  - Log what happened, so problems are easy to diagnose later
-
-Putting this ONCE here (instead of copy-pasting it into every detector)
-is what makes the system modular: if you ever want to use a different
-AI provider (a paid API, a self-hosted model, etc.), you write one new
-small class with the same `call()` method and swap it in. Nothing in
-app.py, the detector functions' signatures, or the frontend needs to
-change.
+This file contains ALL the networking/retry/error-handling code for
+every detection engine used in the project. Putting it here (instead of
+copy-pasting into every detector) is what makes the system modular: if
+you ever want to swap providers again, you write one new class with a
+`call()`-style method and swap it in. Nothing in app.py, the detector
+functions' signatures, or the frontend needs to change.
 """
 
 import os
@@ -34,8 +41,12 @@ logger = logging.getLogger("ai_content_detector")
 
 # Hugging Face's current, supported endpoint for classic "pipeline" style
 # models (text-classification, image-classification, etc.) served through
-# their free hf-inference provider.
+# their free hf-inference provider. Still used by image_detector.py.
 HF_ROUTER_BASE_URL = "https://router.huggingface.co/hf-inference/models"
+
+# Sapling.ai's dedicated AI-text-detection endpoint. Confirmed against
+# their official docs at https://sapling.ai/docs/api/detector/
+SAPLING_DETECT_URL = "https://api.sapling.ai/api/v1/aidetect"
 
 MAX_RETRIES = 3
 RETRY_DELAY_SECONDS = 6
@@ -48,7 +59,7 @@ class DetectionEngineError(Exception):
 
     `reason` is always a short, safe-to-display-to-the-user message.
     `kind` categorizes the failure so calling code can react differently
-    (e.g. show a "Setup needed" message for a missing token, vs a
+    (e.g. show a "Setup needed" message for a missing key, vs a
     "Could not analyze" message for a temporary API problem).
     """
     def __init__(self, reason: str, kind: str = "api_error", status_code: int = None):
@@ -61,6 +72,7 @@ class DetectionEngineError(Exception):
 class HuggingFaceRouterEngine:
     """
     A small, reusable client for Hugging Face's current Router API.
+    Used by image_detector.py (and, through it, video_detector.py).
 
     Usage:
         engine = HuggingFaceRouterEngine(model_id="some-org/some-model")
@@ -175,5 +187,121 @@ class HuggingFaceRouterEngine:
         logger.error("Model '%s' did not become ready after %s retries.", self.model_id, MAX_RETRIES)
         raise DetectionEngineError(
             reason="The AI model is taking unusually long to start. Please try again in a minute.",
+            kind="timeout",
+        )
+
+
+class SaplingTextEngine:
+    """
+    A small, reusable client for Sapling.ai's AI Detector API.
+    Used by text_detector.py.
+
+    This is a dedicated, purpose-built AI-text-detection product (not a
+    community model on shared inference infrastructure), so it doesn't
+    have the "model fails to load" failure mode that Hugging Face did.
+
+    Usage:
+        engine = SaplingTextEngine()
+        raw_json = engine.call(text="some text to check")
+        # raw_json looks like: {"score": 0.93, "sentence_scores": [...]}
+    """
+
+    def __init__(self, key_env_var: str = "SAPLING_API_KEY"):
+        self.key_env_var = key_env_var
+
+    def _get_key(self) -> str:
+        key = os.getenv(self.key_env_var, "").strip()
+        if not key:
+            raise DetectionEngineError(
+                reason=(
+                    f"No Sapling API key found. Set {self.key_env_var} "
+                    f"in your backend/.env file (see .env.example). Get a free "
+                    f"key at https://sapling.ai/."
+                ),
+                kind="missing_token",
+            )
+        return key
+
+    def call(self, *, text: str):
+        """
+        Sends text to Sapling's AI Detector endpoint. Raises
+        DetectionEngineError on any failure — callers should catch this
+        and turn it into a user-facing message. Retries on transient
+        server errors (5xx) and timeouts, but not on 4xx client errors
+        (those won't succeed on retry).
+        """
+        key = self._get_key()
+        payload = {"key": key, "text": text}
+
+        for attempt in range(1, MAX_RETRIES + 1):
+            logger.info("Calling Sapling AI Detector (attempt %s/%s)", attempt, MAX_RETRIES)
+            try:
+                response = requests.post(
+                    SAPLING_DETECT_URL, json=payload, timeout=REQUEST_TIMEOUT_SECONDS,
+                )
+            except requests.exceptions.Timeout:
+                logger.warning("Request to Sapling timed out (attempt %s).", attempt)
+                if attempt == MAX_RETRIES:
+                    raise DetectionEngineError(
+                        reason="The AI detection service took too long to respond. Please try again.",
+                        kind="timeout",
+                    )
+                time.sleep(RETRY_DELAY_SECONDS)
+                continue
+            except requests.exceptions.RequestException as exc:
+                logger.error("Network error calling Sapling: %s", exc)
+                raise DetectionEngineError(
+                    reason="Could not reach the AI detection service. Check your internet connection.",
+                    kind="network_error",
+                )
+
+            if response.status_code == 200:
+                return response.json()
+
+            if response.status_code == 401 or response.status_code == 403:
+                logger.error("Sapling rejected the API key (%s).", response.status_code)
+                raise DetectionEngineError(
+                    reason="Your Sapling API key was rejected. Double-check it in backend/.env.",
+                    kind="auth_error",
+                    status_code=response.status_code,
+                )
+
+            if response.status_code == 429:
+                logger.warning("Sapling rate limit hit (429).")
+                raise DetectionEngineError(
+                    reason="The free usage limit was reached. Please wait a bit and try again.",
+                    kind="rate_limited",
+                    status_code=429,
+                )
+
+            if 500 <= response.status_code < 600:
+                # Server-side problem on Sapling's end — worth a brief retry.
+                logger.warning(
+                    "Sapling returned server error %s (attempt %s/%s), retrying...",
+                    response.status_code, attempt, MAX_RETRIES,
+                )
+                if attempt == MAX_RETRIES:
+                    raise DetectionEngineError(
+                        reason="The AI detection service is temporarily unavailable. Please try again shortly.",
+                        kind="api_error",
+                        status_code=response.status_code,
+                    )
+                time.sleep(RETRY_DELAY_SECONDS)
+                continue
+
+            # Any other 4xx — bad request, text too long, etc. Not worth retrying.
+            logger.error("Sapling returned status %s: %s", response.status_code, response.text[:300])
+            raise DetectionEngineError(
+                reason=(
+                    f"The AI detection service rejected the request "
+                    f"(code {response.status_code}). Please try again with different text."
+                ),
+                kind="api_error",
+                status_code=response.status_code,
+            )
+
+        # Should not normally reach here, but keep a safe fallback.
+        raise DetectionEngineError(
+            reason="The AI detection service is temporarily unavailable. Please try again shortly.",
             kind="timeout",
         )
